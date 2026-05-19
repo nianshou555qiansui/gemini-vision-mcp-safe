@@ -10,8 +10,21 @@ import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { z } from "zod";
 
 const SERVER_NAME = "gemini-vision-mcp-safe";
-const SERVER_VERSION = "1.2.0";
+const SERVER_VERSION = "1.3.0";
 const MAX_REDIRECTS = 5;
+
+function redactProxyUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    if (u.username || u.password) {
+      u.username = "***";
+      u.password = "***";
+    }
+    return u.toString();
+  } catch {
+    return "(invalid URL)";
+  }
+}
 
 const PROXY_URL =
   process.env.HTTPS_PROXY ||
@@ -20,14 +33,28 @@ const PROXY_URL =
   process.env.http_proxy;
 if (PROXY_URL) {
   setGlobalDispatcher(new ProxyAgent(PROXY_URL));
-  console.error(`[${SERVER_NAME}] Using proxy: ${PROXY_URL}`);
+  console.error(`[${SERVER_NAME}] Using proxy: ${redactProxyUrl(PROXY_URL)}`);
+}
+
+function parsePositiveNumberEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    console.error(
+      `[${SERVER_NAME}] Invalid ${name}="${raw}", using default ${fallback}`
+    );
+    return fallback;
+  }
+  return n;
 }
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_VISION_MODEL = process.env.GEMINI_VISION_MODEL || "gemini-2.5-flash";
-const MAX_IMAGE_MB = Number(process.env.GEMINI_VISION_MAX_IMAGE_MB || "10");
+const MAX_IMAGE_MB = parsePositiveNumberEnv("GEMINI_VISION_MAX_IMAGE_MB", 10);
 const MAX_IMAGE_BYTES = MAX_IMAGE_MB * 1024 * 1024;
-const REQUEST_TIMEOUT_MS = Number(process.env.GEMINI_VISION_REQUEST_TIMEOUT_MS || "20000");
+const REQUEST_TIMEOUT_MS = parsePositiveNumberEnv("GEMINI_VISION_REQUEST_TIMEOUT_MS", 20000);
+const GEMINI_TIMEOUT_MS = parsePositiveNumberEnv("GEMINI_VISION_GEMINI_TIMEOUT_MS", 60000);
 const ALLOW_URL = (process.env.GEMINI_VISION_ALLOW_URL || "true").toLowerCase() !== "false";
 const ALLOW_LOCAL_FILE = (process.env.GEMINI_VISION_ALLOW_LOCAL_FILE || "true").toLowerCase() !== "false";
 const BLOCK_LOCAL_URLS = (process.env.GEMINI_VISION_BLOCK_LOCAL_URLS || "true").toLowerCase() !== "false";
@@ -37,7 +64,7 @@ if (!GEMINI_API_KEY) {
   process.exit(1);
 }
 
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
 type LoadedImage = {
@@ -272,7 +299,6 @@ function loadImageFromLocalFile(inputPath: string): LoadedImage {
       `Image too large: ${(stat.size / 1024 / 1024).toFixed(2)}MB. Max: ${MAX_IMAGE_MB}MB`
     );
   }
-  getMimeFromPath(resolved);
   const buffer = fs.readFileSync(resolved);
   const sniffed = sniffImageMime(buffer);
   if (!sniffed) {
@@ -300,6 +326,12 @@ async function loadImage(imageSource: string): Promise<LoadedImage> {
 server.registerTool(
   "analyze_image_with_gemini",
   {
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: false
+    },
     description: [
       "Analyze a local image file or image URL using Google Gemini Vision.",
       "",

@@ -1,0 +1,30 @@
+{
+  "name": "gemini-vision-mcp-safe",
+  "version": "1.2.0",
+  "description": "A minimal safe MCP server for Gemini vision image analysis",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "gemini-vision-mcp-safe": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@google/genai": "^2.3.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "undici": "^8.3.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.22.1",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT"
+}

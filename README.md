@@ -1,5 +1,7 @@
 # gemini-vision-mcp-safe
 
+English｜[简体中文](./README.zh-CN.md)
+
 A minimal, privacy-conscious [MCP](https://modelcontextprotocol.io/) server
 that lets an MCP client (Claude Code, Claude Desktop, etc.) ask **Google
 Gemini** to look at an image — local file or URL — and return a description,

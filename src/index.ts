@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import dnsPromises from "node:dns/promises";
 import { GoogleGenAI } from "@google/genai";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -10,7 +12,7 @@ import { ProxyAgent, setGlobalDispatcher } from "undici";
 import { z } from "zod";
 
 const SERVER_NAME = "gemini-vision-mcp-safe";
-const SERVER_VERSION = "1.3.0";
+const SERVER_VERSION = "1.4.1";
 const MAX_REDIRECTS = 5;
 
 function redactProxyUrl(raw: string): string {
@@ -67,6 +69,23 @@ if (!GEMINI_API_KEY) {
 const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY, httpOptions: { timeout: GEMINI_TIMEOUT_MS } });
 const server = new McpServer({ name: SERVER_NAME, version: SERVER_VERSION });
 
+function mapGeminiError(e: unknown): string {
+  const err = e as Error & { status?: number; code?: string };
+  if (err.code === "ECONNABORTED" || err.message?.includes("timeout")) {
+    return `Gemini 请求超时，请检查代理是否正常运行。(${GEMINI_TIMEOUT_MS}ms)`;
+  } else if (err.status === 403 || err.message?.includes("403")) {
+    return "Gemini 拒绝访问（403），可能是地区限制或 API key 无效，请确认代理已开启。";
+  } else if (err.status === 429 || err.message?.includes("429")) {
+    return "Gemini 请求过于频繁（429），请稍后重试。";
+  } else if (err.status === 503 || err.message?.includes("503") || err.message?.includes("UNAVAILABLE")) {
+    return "Gemini 暂时不可用（503）：服务负载过高或模型刚上线限流，请稍后重试或换个模型。";
+  } else if (err.status === 400 || err.message?.includes("400")) {
+    return `Gemini 请求参数错误（400）: ${err.message}`;
+  } else {
+    return `Gemini 调用失败: ${err.message || String(e)}`;
+  }
+}
+
 type LoadedImage = {
   source: string;
   sourceType: "local_file" | "url";
@@ -91,7 +110,7 @@ function getMimeFromPath(p: string): string {
   const m = MIME_BY_EXT[ext];
   if (!m) {
     throw new Error(
-      `Unsupported image format: ${ext || "(none)"}. Supported: png, jpg, jpeg, webp, gif, bmp, tiff`
+      `不支持的图片格式: ${ext || "(无扩展名)"}。支持: png, jpg, jpeg, webp, gif, bmp, tiff`
     );
   }
   return m;
@@ -154,7 +173,7 @@ async function assertSafeHostname(hostname: string): Promise<void> {
   const lh = h.toLowerCase();
   if (lh === "localhost" || lh.endsWith(".localhost")) {
     throw new Error(
-      `Blocked local hostname: ${hostname}. Set GEMINI_VISION_BLOCK_LOCAL_URLS=false to override.`
+      `已拦截本地主机名: ${hostname}。设置 GEMINI_VISION_BLOCK_LOCAL_URLS=false 可覆盖。`
     );
   }
 
@@ -162,51 +181,67 @@ async function assertSafeHostname(hostname: string): Promise<void> {
   try {
     addresses = await dnsPromises.lookup(h, { all: true });
   } catch (e) {
-    throw new Error(`DNS resolution failed for ${hostname}: ${(e as Error).message}`);
+    throw new Error(`DNS 解析失败 (${hostname}): ${(e as Error).message}`);
   }
 
   if (addresses.length === 0) {
-    throw new Error(`No addresses resolved for ${hostname}`);
+    throw new Error(`无法解析主机名: ${hostname}`);
   }
 
   for (const { address } of addresses) {
     if (isPrivateOrLocalIp(address)) {
       throw new Error(
-        `Blocked URL: ${hostname} resolves to private/local IP ${address}. ` +
-          `Set GEMINI_VISION_BLOCK_LOCAL_URLS=false to override.`
+        `已拦截: ${hostname} 解析到内网/本地 IP ${address}。` +
+          `设置 GEMINI_VISION_BLOCK_LOCAL_URLS=false 可覆盖。`
       );
     }
   }
 }
 
 async function readBodyWithLimit(response: Response, maxBytes: number): Promise<Buffer> {
-  if (!response.body) throw new Error("Response body is empty.");
+  if (!response.body) throw new Error("响应体为空。");
+  const tmpFile = path.join(os.tmpdir(), `gemini-vision-${crypto.randomUUID()}.tmp`);
   const reader = response.body.getReader();
-  const chunks: Buffer[] = [];
   let total = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      total += value.byteLength;
-      if (total > maxBytes) {
-        throw new Error(`Remote image too large. Max allowed: ${MAX_IMAGE_MB}MB`);
+  try {
+    const fd = fs.openSync(tmpFile, "w");
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          total += value.byteLength;
+          if (total > maxBytes) {
+            throw new Error(`远程图片太大，已超过限制。最大允许: ${MAX_IMAGE_MB}MB`);
+          }
+          fs.writeSync(fd, value);
+        }
       }
-      chunks.push(Buffer.from(value));
+    } finally {
+      fs.closeSync(fd);
     }
+    return fs.readFileSync(tmpFile);
+  } finally {
+    try { fs.unlinkSync(tmpFile); } catch {}
   }
-  return Buffer.concat(chunks);
 }
 
 async function fetchImageWithRedirects(
   url: string
 ): Promise<{ buffer: Buffer; mimeType: string; finalUrl: string }> {
   let currentUrl = url;
+  const initialProtocol = new URL(url).protocol;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const parsed = new URL(currentUrl);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      throw new Error(`Only http/https URLs are allowed (got: ${parsed.protocol})`);
+      throw new Error(`只允许 http/https 协议（收到: ${parsed.protocol}）`);
+    }
+
+    if (initialProtocol === "https:" && parsed.protocol === "http:") {
+      throw new Error(
+        `安全拦截：原始请求是 HTTPS，但重定向目标降级为 HTTP（${currentUrl}），已阻止。`
+      );
     }
 
     await assertSafeHostname(parsed.hostname);
@@ -228,17 +263,17 @@ async function fetchImageWithRedirects(
       if (response.status >= 300 && response.status < 400) {
         const location = response.headers.get("location");
         if (!location) {
-          throw new Error(`Redirect ${response.status} without Location header`);
+          throw new Error(`重定向 ${response.status} 但没有 Location 头`);
         }
         if (hop === MAX_REDIRECTS) {
-          throw new Error(`Too many redirects (>${MAX_REDIRECTS})`);
+          throw new Error(`重定向次数过多（超过 ${MAX_REDIRECTS} 次）`);
         }
         currentUrl = new URL(location, currentUrl).toString();
         continue;
       }
 
       if (!response.ok) {
-        throw new Error(`Failed to fetch image: HTTP ${response.status}`);
+        throw new Error(`获取图片失败: HTTP ${response.status}`);
       }
 
       const contentLength = response.headers.get("content-length");
@@ -246,7 +281,7 @@ async function fetchImageWithRedirects(
         const size = Number(contentLength);
         if (!Number.isNaN(size) && size > MAX_IMAGE_BYTES) {
           throw new Error(
-            `Remote image too large: ${(size / 1024 / 1024).toFixed(2)}MB. Max: ${MAX_IMAGE_MB}MB`
+            `远程图片太大: ${(size / 1024 / 1024).toFixed(2)}MB。最大允许: ${MAX_IMAGE_MB}MB`
           );
         }
       }
@@ -255,7 +290,7 @@ async function fetchImageWithRedirects(
       const sniffed = sniffImageMime(buffer);
       if (!sniffed) {
         throw new Error(
-          "Downloaded content is not a recognized image format (PNG/JPEG/WEBP/GIF/BMP/TIFF)."
+          "下载的内容不是可识别的图片格式（支持 PNG/JPEG/WEBP/GIF/BMP/TIFF）。"
         );
       }
 
@@ -265,12 +300,12 @@ async function fetchImageWithRedirects(
     }
   }
 
-  throw new Error("Unreachable: redirect loop exited without return");
+  throw new Error("不可达：重定向循环异常退出");
 }
 
 async function loadImageFromUrl(url: string): Promise<LoadedImage> {
   if (!ALLOW_URL) {
-    throw new Error("URL image input is disabled by GEMINI_VISION_ALLOW_URL=false.");
+    throw new Error("URL 图片输入已禁用（GEMINI_VISION_ALLOW_URL=false）。");
   }
   const { buffer, mimeType, finalUrl } = await fetchImageWithRedirects(url);
   return {
@@ -284,26 +319,26 @@ async function loadImageFromUrl(url: string): Promise<LoadedImage> {
 
 function loadImageFromLocalFile(inputPath: string): LoadedImage {
   if (!ALLOW_LOCAL_FILE) {
-    throw new Error("Local file image input is disabled by GEMINI_VISION_ALLOW_LOCAL_FILE=false.");
+    throw new Error("本地文件图片输入已禁用（GEMINI_VISION_ALLOW_LOCAL_FILE=false）。");
   }
   const resolved = path.resolve(inputPath);
   if (!fs.existsSync(resolved)) {
-    throw new Error(`Image file not found: ${resolved}`);
+    throw new Error(`图片文件不存在: ${resolved}`);
   }
   const stat = fs.statSync(resolved);
   if (!stat.isFile()) {
-    throw new Error(`Path is not a file: ${resolved}`);
+    throw new Error(`路径不是文件: ${resolved}`);
   }
   if (stat.size > MAX_IMAGE_BYTES) {
     throw new Error(
-      `Image too large: ${(stat.size / 1024 / 1024).toFixed(2)}MB. Max: ${MAX_IMAGE_MB}MB`
+      `图片太大: ${(stat.size / 1024 / 1024).toFixed(2)}MB。最大允许: ${MAX_IMAGE_MB}MB`
     );
   }
   const buffer = fs.readFileSync(resolved);
   const sniffed = sniffImageMime(buffer);
   if (!sniffed) {
     throw new Error(
-      `File contents do not match a supported image format (extension: ${path.extname(resolved)})`
+      `文件内容不是支持的图片格式（扩展名: ${path.extname(resolved)}）`
     );
   }
   return {
@@ -359,6 +394,12 @@ server.registerTool(
         .describe(
           "What to analyze. Example: 'Extract all visible text and summarize the screenshot.'"
         ),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          "Override the Gemini model for this call. Examples: gemini-2.5-flash, gemini-2.5-pro. Defaults to env GEMINI_VISION_MODEL."
+        ),
       confirm_send_to_gemini: z
         .boolean()
         .optional()
@@ -368,7 +409,7 @@ server.registerTool(
         )
     }
   },
-  async ({ image_source, prompt, confirm_send_to_gemini }) => {
+  async ({ image_source, prompt, model, confirm_send_to_gemini }) => {
     const cleaned = cleanInputSource(image_source);
 
     if (!confirm_send_to_gemini) {
@@ -400,40 +441,209 @@ server.registerTool(
       };
     }
 
-    const loaded = await loadImage(cleaned);
+    const useModel = model || GEMINI_VISION_MODEL;
+
+    let loaded: LoadedImage;
+    try {
+      loaded = await loadImage(cleaned);
+    } catch (e: unknown) {
+      const err = e as Error;
+      return {
+        content: [{ type: "text", text: `图片加载失败: ${err.message || String(e)}` }],
+        isError: true
+      };
+    }
+
     const finalPrompt =
       prompt || "请详细描述这张图片的内容。如果图片中有文字，请尽可能完整地提取出来。";
 
-    const response = await ai.models.generateContent({
-      model: GEMINI_VISION_MODEL,
-      contents: [
-        { inlineData: { mimeType: loaded.mimeType, data: loaded.base64 } },
-        { text: finalPrompt }
-      ]
-    });
+    try {
+      const response = await ai.models.generateContent({
+        model: useModel,
+        contents: [
+          { inlineData: { mimeType: loaded.mimeType, data: loaded.base64 } },
+          { text: finalPrompt }
+        ]
+      });
 
-    const text =
-      response.text ||
-      "Gemini returned an empty response. Please try a clearer image or a more specific prompt.";
+      const text =
+        response.text ||
+        "Gemini 返回了空响应。请尝试更清晰的图片或更具体的提示词。";
 
-    return {
-      content: [
-        {
-          type: "text",
-          text: [
-            "Gemini vision analysis completed.",
-            `Model: ${GEMINI_VISION_MODEL}`,
-            `Source type: ${loaded.sourceType}`,
-            `Source: ${loaded.source}`,
-            `MIME: ${loaded.mimeType}`,
-            `Size: ${(loaded.sizeBytes / 1024 / 1024).toFixed(2)}MB`,
-            "",
-            "Result:",
-            text
-          ].join("\n")
-        }
-      ]
-    };
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "Gemini 视觉分析完成。",
+              `模型: ${useModel}`,
+              `来源类型: ${loaded.sourceType}`,
+              `来源: ${loaded.source}`,
+              `MIME: ${loaded.mimeType}`,
+              `大小: ${(loaded.sizeBytes / 1024 / 1024).toFixed(2)}MB`,
+              "",
+              "结果:",
+              text
+            ].join("\n")
+          }
+        ]
+      };
+    } catch (e: unknown) {
+      return {
+        content: [{ type: "text", text: mapGeminiError(e) }],
+        isError: true
+      };
+    }
+  }
+);
+
+server.registerTool(
+  "analyze_images_batch",
+  {
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      openWorldHint: true,
+      idempotentHint: false
+    },
+    description: [
+      "Batch analyze multiple images (2-5) using Google Gemini Vision.",
+      "",
+      "Same privacy rules as analyze_image_with_gemini apply.",
+      "Useful for comparing screenshots, before/after views, or multi-page documents.",
+      "",
+      "Supported inputs: local file paths or HTTP/HTTPS image URLs (can mix)."
+    ].join("\n"),
+    inputSchema: {
+      image_sources: z
+        .array(z.string())
+        .min(2)
+        .max(5)
+        .describe(
+          "Array of 2-5 image sources (local paths or URLs). Example: ['C:/a.png', 'https://example.com/b.png']"
+        ),
+      prompt: z
+        .string()
+        .optional()
+        .describe(
+          "What to analyze across all images. Example: 'Compare these two screenshots and list differences.'"
+        ),
+      model: z
+        .string()
+        .optional()
+        .describe(
+          "Override the Gemini model. Defaults to env GEMINI_VISION_MODEL."
+        ),
+      confirm_send_to_gemini: z
+        .boolean()
+        .optional()
+        .default(false)
+        .describe(
+          "Must be true only after the user explicitly agrees. Defaults to false."
+        )
+    }
+  },
+  async ({ image_sources, prompt, model, confirm_send_to_gemini }) => {
+    if (!confirm_send_to_gemini) {
+      const summary = image_sources
+        .map((s: string) => {
+          const c = cleanInputSource(s);
+          return `  - [${isHttpUrl(c) ? "URL" : "本地文件"}] ${c}`;
+        })
+        .join("\n");
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "需要你的确认：",
+              "",
+              `这个工具会把 ${image_sources.length} 张图片发送到 Google Gemini API 进行视觉分析。`,
+              "",
+              "图片列表：",
+              summary,
+              "",
+              "如果你同意，请回复确认，然后我会设置 confirm_send_to_gemini=true 再次调用。",
+              "",
+              "注意：",
+              "- 如果图片包含隐私、密钥、账号、公司内部数据，请先打码或不要发送。",
+              "- URL 图片会先从你的电脑下载。"
+            ].join("\n")
+          }
+        ]
+      };
+    }
+
+    const useModel = model || GEMINI_VISION_MODEL;
+
+    let loadedImages: LoadedImage[];
+    try {
+      loadedImages = await Promise.all(
+        image_sources.map(async (s: string, i: number) => {
+          try {
+            return await loadImage(s);
+          } catch (e) {
+            const m = (e as Error).message || String(e);
+            throw new Error(`第 ${i + 1} 张: ${m}`);
+          }
+        })
+      );
+    } catch (e: unknown) {
+      const err = e as Error;
+      return {
+        content: [{ type: "text", text: `图片加载失败: ${err.message || String(e)}` }],
+        isError: true
+      };
+    }
+
+    const finalPrompt =
+      prompt || "请详细描述并对比这些图片的内容。";
+
+    const contents: Array<{ inlineData: { mimeType: string; data: string } } | { text: string }> = [];
+    for (const img of loadedImages) {
+      contents.push({ inlineData: { mimeType: img.mimeType, data: img.base64 } });
+    }
+    contents.push({ text: finalPrompt });
+
+    try {
+      const response = await ai.models.generateContent({
+        model: useModel,
+        contents
+      });
+
+      const text =
+        response.text ||
+        "Gemini 返回了空响应。请尝试更清晰的图片或更具体的提示词。";
+
+      const meta = loadedImages
+        .map(
+          (img, i) =>
+            `  图片${i + 1}: [${img.sourceType}] ${img.source} (${img.mimeType}, ${(img.sizeBytes / 1024 / 1024).toFixed(2)}MB)`
+        )
+        .join("\n");
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: [
+              "Gemini 多图视觉分析完成。",
+              `模型: ${useModel}`,
+              `图片数量: ${loadedImages.length}`,
+              meta,
+              "",
+              "结果:",
+              text
+            ].join("\n")
+          }
+        ]
+      };
+    } catch (e: unknown) {
+      return {
+        content: [{ type: "text", text: mapGeminiError(e) }],
+        isError: true
+      };
+    }
   }
 );
 
